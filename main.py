@@ -1,32 +1,26 @@
 #!/usr/bin/env python3
 """
-main.py — Dynamic Support & Resistance Trading Bot
-
-Core DSR Strategy:
-- MA crossovers and rearrangement confirm trend changes
-- MA1 (SMMA HLC3-9) and MA2 (SMMA Close-19) = Dynamic S/R
-- MA3 (SMA MA2-25) = Trend filter
-- BUY BIAS: Only when MA1 > MA2 (bullish arrangement)
-- SELL BIAS: Only when MA1 < MA2 (bearish arrangement)
-- Rejection patterns at MA1/MA2 levels = Signals
+main.py — Adaptive Dynamic Support & Resistance Trading Bot
+COMPLETE FILE - Replace your entire main.py with this
 """
 
 import os, json, time, tempfile, traceback
 from datetime import datetime, timezone
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple
+from enum import Enum
 import websocket, matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
-# Telegram helpers (fallback to print)
+# Telegram helpers
 try:
     from bot import send_telegram_message, send_telegram_photo
 except Exception:
     def send_telegram_message(token, chat_id, text): print("[TEXT]", text); return True, "local"
     def send_telegram_photo(token, chat_id, caption, photo): print("[PHOTO]", caption, photo); return True, "local"
 
-# -------------------------
 # Config
-# -------------------------
 DERIV_API_KEY = os.getenv("DERIV_API_KEY","").strip()
 DERIV_APP_ID  = os.getenv("DERIV_APP_ID","1089").strip()
 DERIV_WS_URL  = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
@@ -38,41 +32,50 @@ DEBUG = os.getenv("DEBUG","0") == "1"
 TEST_MODE = os.getenv("TEST_MODE","0") == "1"
 
 CANDLES_N = 480
-LAST_N_CHART = 180
-CANDLE_WIDTH = 0.35
+LAST_N_CHART = 200
+CANDLE_WIDTH = 0.25
 TMPDIR = tempfile.gettempdir()
 ALERT_FILE = os.path.join(TMPDIR, "dsr_last_sent_main.json")
 MIN_CANDLES = 50
+LOOKBACK_PERIOD = 12
 
-# -------------------------
 # Symbol Mappings
-# -------------------------
 SYMBOL_MAP = {
-    "V10": "R_10",
-    "V25": "R_25",
-    "V50": "R_50", 
-    "V75": "R_75",
-    "Jump10": "JD10",
-    "Jump25": "JD25",
-    "Jump50": "JD50", 
-    "Jump100": "JD100",
-    # CORRECTED 1s indices symbols from Deriv API
-    "V75(1s)": "1s_V75",     # Fixed from R_1HZ75V
-    "V100(1s)": "1s_V100",   # Fixed from R_1HZ100V  
-    "V150(1s)": "1s_V150",   # Fixed from R_1HZ150V
-    "V15(1s)": "1s_V15"      # Fixed from R_1HZ15V
-}
+    
+    "Jump10": "JD10", "Jump25": "JD25", "Jump50": "JD50", 
+    "Jump75": "JD75", "Jump100": "JD100",
+    "V75(1s)": "1s_V75",
 
 SYMBOL_TF_MAP = {
     "V75(1s)": 1,
-    "V100(1s)": 1,  
-    "V150(1s)": 1,
-    "V15(1s)": 1
 }
 
-# -------------------------
+# Enums
+class TrendDirection(Enum):
+    UPTREND = "UPTREND"
+    DOWNTREND = "DOWNTREND"
+    RANGING = "RANGING"
+
+class SignalType(Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+    NO_SIGNAL = "NO_SIGNAL"
+
+class CandlestickPattern(Enum):
+    PIN_BAR_UP = "PIN_BAR_UP"
+    PIN_BAR_DOWN = "PIN_BAR_DOWN"
+    DOJI = "DOJI"
+    BULLISH_ENGULFING = "BULLISH_ENGULFING"
+    BEARISH_ENGULFING = "BEARISH_ENGULFING"
+    NO_PATTERN = "NO_PATTERN"
+
+@dataclass
+class MovingAverages:
+    ma1: float
+    ma2: float
+    ma3: float
+
 # Persistence
-# -------------------------
 def load_persist():
     try:
         return json.load(open(ALERT_FILE))
@@ -94,58 +97,52 @@ def already_sent(shorthand, tf, epoch, side):
 def mark_sent(shorthand, tf, epoch, side):
     d=load_persist(); d[f"{shorthand}|{tf}"]={"epoch":epoch,"side":side}; save_persist(d)
 
-# -------------------------
+def get_timeframe_for_symbol(shorthand):
+    return SYMBOL_TF_MAP.get(shorthand, TIMEFRAMES[0] if TIMEFRAMES else 300)
+
 # Moving Averages
-# -------------------------
 def smma_correct(series, period):
-    """Proper SMMA calculation"""
     n = len(series)
     if n < period:
         return [None] * n
-    
+
     result = [None] * (period - 1)
     first_sma = sum(series[:period]) / period
     result.append(first_sma)
-    
+
     prev_smma = first_sma
     for i in range(period, n):
         current_smma = (prev_smma * (period - 1) + series[i]) / period
         result.append(current_smma)
         prev_smma = current_smma
-    
+
     return result
 
 def sma(series, period):
-    """Standard SMA calculation"""
     n = len(series)
     if n < period:
         return [None] * n
-    
+
     result = [None] * (period - 1)
     window_sum = sum(series[:period])
     result.append(window_sum / period)
-    
+
     for i in range(period, n):
         window_sum += series[i] - series[i - period]
         result.append(window_sum / period)
-    
+
     return result
 
 def compute_mas(candles):
-    """Compute MAs exactly as per strategy"""
     closes = [c["close"] for c in candles]
     hlc3 = [(c["high"] + c["low"] + c["close"]) / 3.0 for c in candles]
-    
-    # MA1 → SMMA of HLC3, period 9
-    ma1 = smma_correct(hlc3, 9)
-    
-    # MA2 → SMMA of Close, period 19  
-    ma2 = smma_correct(closes, 19)
-    
-    # MA3 → SMA of MA2, period 25
+
+    ma1 = smma_correct(hlc3, 6)
+    ma2 = smma_correct(closes, 15)
+
     ma2_valid = [v for v in ma2 if v is not None]
-    if len(ma2_valid) >= 25:
-        ma3_calc = sma(ma2_valid, 25)
+    if len(ma2_valid) >= 20:
+        ma3_calc = sma(ma2_valid, 20)
         ma3 = []
         valid_idx = 0
         for v in ma2:
@@ -159,141 +156,286 @@ def compute_mas(candles):
                 valid_idx += 1
     else:
         ma3 = [None] * len(candles)
-    
+
     return ma1, ma2, ma3
 
-# -------------------------
-# MA Crossover Detection (Core DSR)
-# -------------------------
-def detect_ma_crossover(ma1, ma2, current_idx, lookback=3):
-    """Detect MA crossovers - key for trend change confirmation"""
-    if current_idx < lookback:
-        return False, "NONE"
-    
-    current_ma1 = ma1[current_idx]
-    current_ma2 = ma2[current_idx]
-    
-    if current_ma1 is None or current_ma2 is None:
-        return False, "NONE"
-    
-    # Check for crossover in last 3 candles
-    for i in range(current_idx - lookback + 1, current_idx + 1):
-        if i > 0 and i < len(ma1) and i < len(ma2):
-            prev_ma1 = ma1[i-1]
-            prev_ma2 = ma2[i-1]
-            curr_ma1 = ma1[i]
-            curr_ma2 = ma2[i]
-            
-            if all(v is not None for v in [prev_ma1, prev_ma2, curr_ma1, curr_ma2]):
-                # Bullish crossover: MA1 crosses above MA2
-                if prev_ma1 <= prev_ma2 and curr_ma1 > curr_ma2:
-                    return True, "BULLISH_CROSSOVER"
-                
-                # Bearish crossover: MA1 crosses below MA2  
-                if prev_ma1 >= prev_ma2 and curr_ma1 < curr_ma2:
-                    return True, "BEARISH_CROSSOVER"
-    
-    return False, "NONE"
+def create_ma_objects(ma1_list, ma2_list, ma3_list):
+    mas = []
+    min_len = min(len(ma1_list), len(ma2_list), len(ma3_list))
 
-def get_ma_arrangement(ma1_val, ma2_val, ma3_val):
-    """Get current MA arrangement for trend confirmation"""
-    if not all(v is not None for v in [ma1_val, ma2_val, ma3_val]):
-        return "UNDEFINED"
-    
-    if ma1_val > ma2_val > ma3_val:
-        return "BULLISH_ARRANGEMENT"  # MA1 on top = uptrend
-    elif ma1_val < ma2_val < ma3_val:
-        return "BEARISH_ARRANGEMENT"  # MA1 on bottom = downtrend
+    for i in range(min_len):
+        if all(v is not None for v in [ma1_list[i], ma2_list[i], ma3_list[i]]):
+            mas.append(MovingAverages(ma1_list[i], ma2_list[i], ma3_list[i]))
+        else:
+            mas.append(None)
+
+    return mas
+
+# Trend Detection
+def detect_adaptive_trend(mas_objects, current_price):
+    if len(mas_objects) < LOOKBACK_PERIOD:
+        return TrendDirection.RANGING
+
+    current_ma = mas_objects[-1]
+    if current_ma is None:
+        return TrendDirection.RANGING
+
+    uptrend_arrangement = (current_price > current_ma.ma1 > current_ma.ma2 > current_ma.ma3)
+    downtrend_arrangement = (current_ma.ma3 > current_ma.ma2 > current_ma.ma1 > current_price)
+
+    if not (uptrend_arrangement or downtrend_arrangement):
+        return TrendDirection.RANGING
+
+    consistent_periods = 0
+    lookback_mas = mas_objects[-min(LOOKBACK_PERIOD, len(mas_objects)):]
+    valid_mas = [ma for ma in lookback_mas if ma is not None]
+
+    if len(valid_mas) < LOOKBACK_PERIOD * 0.45
+        return TrendDirection.RANGING
+
+    for ma in valid_mas:
+        if uptrend_arrangement:
+            if ma.ma1 > ma.ma2 > ma.ma3:
+                consistent_periods += 1
+        elif downtrend_arrangement:
+            if ma.ma3 > ma.ma2 > ma.ma1:
+                consistent_periods += 1
+
+    consistency_ratio = consistent_periods / len(valid_mas)
+
+    if consistency_ratio >= 0.45:
+        return TrendDirection.UPTREND if uptrend_arrangement else TrendDirection.DOWNTREND
+
+    return TrendDirection.RANGING
+
+# Market Condition Detection
+def assess_ma_separation_quality(mas_objects):
+    if len(mas_objects) < LOOKBACK_PERIOD:
+        return False
+
+    recent_mas = mas_objects[-LOOKBACK_PERIOD:]
+    valid_mas = [ma for ma in recent_mas if ma is not None]
+
+    if len(valid_mas) < LOOKBACK_PERIOD * 0.45:
+        return False
+
+    separations = []
+    for ma in valid_mas:
+        sep1 = abs(ma.ma1 - ma.ma2)
+        sep2 = abs(ma.ma2 - ma.ma3)
+        separations.extend([sep1, sep2])
+
+    if not separations:
+        return False
+
+    avg_separation = sum(separations) / len(separations)
+    current_ma = mas_objects[-1]
+
+    if current_ma is None:
+        return False
+
+    current_sep1 = abs(current_ma.ma1 - current_ma.ma2)
+    current_sep2 = abs(current_ma.ma2 - current_ma.ma3)
+
+    return (current_sep1 > avg_separation * 0.4 and current_sep2 > avg_separation * 0.4)
+
+def count_ma_crossovers(mas_objects):
+    if len(mas_objects) < 2:
+        return 0
+
+    crossovers = 0
+    recent_mas = mas_objects[-min(LOOKBACK_PERIOD, len(mas_objects)):]
+    valid_pairs = []
+
+    for i in range(1, len(recent_mas)):
+        if recent_mas[i-1] is not None and recent_mas[i] is not None:
+            valid_pairs.append((recent_mas[i-1], recent_mas[i]))
+
+    for prev_ma, curr_ma in valid_pairs:
+        if ((prev_ma.ma1 > prev_ma.ma2) != (curr_ma.ma1 > curr_ma.ma2)):
+            crossovers += 1
+        if ((prev_ma.ma2 > prev_ma.ma3) != (curr_ma.ma2 > curr_ma.ma3)):
+            crossovers += 1
+
+    return crossovers
+
+def is_adaptive_ranging_market(mas_objects, candles):
+    if len(mas_objects) < LOOKBACK_PERIOD:
+        return True
+
+    crossovers = count_ma_crossovers(mas_objects)
+    recent_candles = candles[-LOOKBACK_PERIOD:]
+    avg_range = sum(c["high"] - c["low"] for c in recent_candles) / len(recent_candles)
+    max_crossovers = max(3, int(avg_range * 1000))
+
+    recent_ma3 = []
+    for ma in mas_objects[-min(10, len(mas_objects)):]:
+        if ma is not None:
+            recent_ma3.append(ma.ma3)
+
+    if len(recent_ma3) >= 2:
+        ma3_slope = abs(recent_ma3[-1] - recent_ma3[0]) / len(recent_ma3)
+        slope_threshold = avg_range * 0.1
     else:
-        return "MIXED_ARRANGEMENT"  # MAs mixed = no clear trend
+        ma3_slope = 0
+        slope_threshold = avg_range * 0.1
 
-# -------------------------
-# Rejection Detection
-# -------------------------
-def is_rejection_candle(candle):
-    """Simple rejection detection - any candle showing rejection behavior"""
+    return crossovers > max_crossovers and ma3_slope < slope_threshold
+
+def detect_adaptive_price_spike(candles):
+    if len(candles) < 10:
+        return False
+
+    recent_candles = candles[-10:]
+    current_candle = candles[-1]
+
+    historical_candles = recent_candles[:-1]
+    avg_range = sum(c["high"] - c["low"] for c in historical_candles) / len(historical_candles)
+    avg_body = sum(abs(c["close"] - c["open"]) for c in historical_candles) / len(historical_candles)
+
+    current_range = current_candle["high"] - current_candle["low"]
+    current_body = abs(current_candle["close"] - current_candle["open"])
+
+    range_spike = current_range > avg_range * 2.5
+    body_spike = current_body > avg_body * 3.0
+
+    return range_spike or body_spike
+
+# Pattern Detection
+def detect_candlestick_pattern(candle, recent_candles):
+    if len(recent_candles) < 5:
+        return CandlestickPattern.NO_PATTERN
+
+    recent_bodies = [abs(c["close"] - c["open"]) for c in recent_candles[-5:]]
+    avg_body = sum(recent_bodies) / len(recent_bodies) if recent_bodies else 0.01
+
     o, h, l, c = candle["open"], candle["high"], candle["low"], candle["close"]
     body_size = abs(c - o)
     total_range = h - l
-    
-    if total_range <= 0:
-        return False, "NONE"
-    
     upper_wick = h - max(o, c)
     lower_wick = min(o, c) - l
-    
-    # Any meaningful rejection signals
-    has_upper_wick = upper_wick > 0
-    has_lower_wick = lower_wick > 0
-    has_small_body = body_size < total_range * 0.7  # Body less than 70% of range
-    
-    # Rejection criteria - very lenient
-    if has_upper_wick and (upper_wick >= body_size * 0.5 or has_small_body):
-        return True, "UPPER_REJECTION"
-    
-    if has_lower_wick and (lower_wick >= body_size * 0.5 or has_small_body):
-        return True, "LOWER_REJECTION"
-    
-    if has_small_body and (has_upper_wick or has_lower_wick):
-        return True, "SMALL_BODY_REJECTION"
-    
-    return False, "NONE"
 
-# -------------------------
-# MA Level Proximity
-# -------------------------
-def near_ma_levels(price, ma1_val, ma2_val):
-    """Check if price is ACTUALLY near MA1 or MA2 - much stricter"""
-    if ma1_val is None or ma2_val is None:
-        return False, "NONE"
-    
-    # MUCH TIGHTER tolerance - 0.1% instead of 1%
-    tolerance1 = abs(ma1_val) * 0.001  # 0.1% around MA1
-    tolerance2 = abs(ma2_val) * 0.001  # 0.1% around MA2
-    
-    if abs(price - ma1_val) <= tolerance1:
-        return True, "MA1"
-    
-    if abs(price - ma2_val) <= tolerance2:
-        return True, "MA2"
-    
-    return False, "NONE"
+    if total_range <= 0:
+        return CandlestickPattern.NO_PATTERN
 
-# -------------------------
-# Ranging Market Detection
-# -------------------------
-def check_ranging_market(candles, ma1, ma2, current_idx, lookback=10):
-    """Check if price touches MA2 more than twice = ranging market"""
-    if current_idx < lookback:
+    min_wick_ratio = 1.2
+    min_wick_size = max(body_size * min_wick_ratio, avg_body * 0.8)
+
+    if lower_wick >= min_wick_size and upper_wick < body_size * 0.5:
+        return CandlestickPattern.PIN_BAR_UP
+
+    if upper_wick >= min_wick_size and lower_wick < body_size * 0.5:
+        return CandlestickPattern.PIN_BAR_DOWN
+
+    if body_size <= total_range * 0.1 and total_range > avg_body:
+        return CandlestickPattern.DOJI
+
+    if len(recent_candles) >= 2:
+        prev_candle = recent_candles[-2]
+        prev_o, prev_c = prev_candle["open"], prev_candle["close"]
+
+        if (prev_c < prev_o and c > o and c > prev_o and o < prev_c):
+            return CandlestickPattern.BULLISH_ENGULFING
+
+        if (prev_c > prev_o and c < o and c < prev_o and o > prev_c):
+            return CandlestickPattern.BEARISH_ENGULFING
+
+    return CandlestickPattern.NO_PATTERN
+
+def is_price_near_ma(price_level, ma_level, recent_ranges):
+    if not recent_ranges:
         return False
-    
-    ma2_touches = 0
-    
-    for i in range(current_idx - lookback + 1, current_idx + 1):
-        if i < len(candles) and i < len(ma2) and ma2[i] is not None:
-            candle = candles[i]
-            ma2_val = ma2[i]
-            
-            # Check if candle touched MA2 (high/low spans across MA2)
-            if candle["low"] <= ma2_val <= candle["high"]:
-                ma2_touches += 1
-    
-    # If price touches MA2 more than twice in lookback period = ranging
-    return ma2_touches > 2
 
-# -------------------------
+    avg_range = sum(recent_ranges) / len(recent_ranges)
+    proximity_threshold = avg_range * 0.5
+
+    return abs(price_level - ma_level) <= proximity_threshold
+
+def detect_rejection_at_ma(candle, current_ma, trend, recent_candles):
+    recent_ranges = [c["high"] - c["low"] for c in recent_candles[-10:]]
+    pattern = detect_candlestick_pattern(candle, recent_candles)
+
+    if pattern == CandlestickPattern.NO_PATTERN:
+        return False, pattern, "NONE"
+
+    h, l = candle["high"], candle["low"]
+
+    if trend == TrendDirection.UPTREND:
+        at_ma1 = is_price_near_ma(l, current_ma.ma1, recent_ranges)
+        at_ma2 = is_price_near_ma(l, current_ma.ma2, recent_ranges)
+
+        valid_patterns = [CandlestickPattern.PIN_BAR_UP, CandlestickPattern.DOJI, 
+                         CandlestickPattern.BULLISH_ENGULFING]
+
+        if pattern in valid_patterns and at_ma1:
+            return True, pattern, "MA1"
+        elif pattern in valid_patterns and at_ma2:
+            return True, pattern, "MA2"
+
+    elif trend == TrendDirection.DOWNTREND:
+        at_ma1 = is_price_near_ma(h, current_ma.ma1, recent_ranges)
+        at_ma2 = is_price_near_ma(h, current_ma.ma2, recent_ranges)
+
+        valid_patterns = [CandlestickPattern.PIN_BAR_DOWN, CandlestickPattern.DOJI,
+                         CandlestickPattern.BEARISH_ENGULFING]
+
+        if pattern in valid_patterns and at_ma1:
+            return True, pattern, "MA1"
+        elif pattern in valid_patterns and at_ma2:
+            return True, pattern, "MA2"
+
+    return False, CandlestickPattern.NO_PATTERN, "NONE"
+
+def calculate_signal_confidence(trend, pattern, mas_objects, candles):
+    confidence = 0.0
+
+    if len(mas_objects) >= LOOKBACK_PERIOD:
+        consistent_periods = 0
+        lookback_mas = mas_objects[-LOOKBACK_PERIOD:]
+        valid_mas = [ma for ma in lookback_mas if ma is not None]
+
+        for ma in valid_mas:
+            if trend == TrendDirection.UPTREND and ma.ma1 > ma.ma2 > ma.ma3:
+                consistent_periods += 1
+            elif trend == TrendDirection.DOWNTREND and ma.ma3 > ma.ma2 > ma.ma1:
+                consistent_periods += 1
+
+        if valid_mas:
+            trend_consistency = consistent_periods / len(valid_mas)
+            confidence += trend_consistency * 0.3
+
+    if assess_ma_separation_quality(mas_objects):
+        confidence += 0.25
+
+    pattern_scores = {
+        CandlestickPattern.PIN_BAR_UP: 0.25,
+        CandlestickPattern.PIN_BAR_DOWN: 0.25,
+        CandlestickPattern.DOJI: 0.15,
+        CandlestickPattern.BULLISH_ENGULFING: 0.20,
+        CandlestickPattern.BEARISH_ENGULFING: 0.20
+    }
+    confidence += pattern_scores.get(pattern, 0)
+
+    recent_candles = candles[-5:]
+    avg_body = sum(abs(c["close"] - c["open"]) for c in recent_candles) / len(recent_candles)
+    avg_range = sum(c["high"] - c["low"] for c in recent_candles) / len(recent_candles)
+
+    if avg_range > 0:
+        stability_ratio = 1 - (avg_body / avg_range)
+        confidence += stability_ratio * 0.2
+
+    return min(confidence, 1.0)
+
 # Data Fetching
-# -------------------------
 def fetch_candles(sym, tf, count=CANDLES_N):
-    """Fetch candles from Deriv API"""
     for attempt in range(3):
         try:
             ws = websocket.create_connection(DERIV_WS_URL, timeout=20)
-            
+
             if DERIV_API_KEY:
                 ws.send(json.dumps({"authorize": DERIV_API_KEY}))
                 auth_resp = ws.recv()
-            
+
             request = {
                 "ticks_history": sym,
                 "style": "candles", 
@@ -301,14 +443,14 @@ def fetch_candles(sym, tf, count=CANDLES_N):
                 "count": count,
                 "end": "latest"
             }
-            
+
             ws.send(json.dumps(request))
             response = json.loads(ws.recv())
             ws.close()
-            
+
             if DEBUG:
                 print(f"Fetched {len(response.get('candles', []))} candles for {sym}")
-            
+
             if "candles" in response and response["candles"]:
                 return [{
                     "epoch": int(c["epoch"]),
@@ -317,313 +459,364 @@ def fetch_candles(sym, tf, count=CANDLES_N):
                     "low": float(c["low"]),
                     "close": float(c["close"])
                 } for c in response["candles"]]
-        
+
         except Exception as e:
             if DEBUG:
                 print(f"Attempt {attempt + 1} failed for {sym}: {e}")
             time.sleep(1)
-    
+
     return []
 
-# -------------------------
-# Core DSR Signal Detection
-# -------------------------
-def detect_signal(candles, tf, shorthand):
-    """Complete DSR Strategy - All rules implemented correctly"""
+# Signal Detection with Timing Fix
+def detect_adaptive_signal(candles, tf, shorthand):
     n = len(candles)
-    if n < MIN_CANDLES:
+    if n < MIN_CANDLES + 1:
         return None
-    
-    current_idx = n - 1
-    current_candle = candles[current_idx]
-    
-    # Compute moving averages
-    ma1, ma2, ma3 = compute_mas(candles)
-    
-    current_ma1 = ma1[current_idx] if current_idx < len(ma1) else None
-    current_ma2 = ma2[current_idx] if current_idx < len(ma2) else None
-    current_ma3 = ma3[current_idx] if current_idx < len(ma3) else None
-    
-    if not all(v is not None for v in [current_ma1, current_ma2, current_ma3]):
-        return None
-    
-    current_close = current_candle["close"]
-    current_high = current_candle["high"]
-    current_low = current_candle["low"]
-    
-    # DSR RULE 1: Determine bias from MA1/MA2 relationship
-    if current_ma1 > current_ma2:
-        bias = "BUY_BIAS"
-    elif current_ma1 < current_ma2:
-        bias = "SELL_BIAS"
-    else:
-        # MA1 = MA2, no clear bias
-        return None
-    
-    # DSR RULE 2 & 3: Price position requirements
-    if bias == "BUY_BIAS" and current_close <= current_ma1:
-        # BUY signals only when price ABOVE MA1
-        return None
-        
-    if bias == "SELL_BIAS" and current_close >= current_ma1:
-        # SELL signals only when price BELOW MA1
-        return None
-    
-    # DSR RULE 4: NO signals when price between MAs
-    if current_ma1 > current_ma2:  # Uptrend structure
-        if current_ma2 < current_close < current_ma1:
-            return None  # Price between MA2 and MA1
-    else:  # Downtrend structure  
-        if current_ma1 < current_close < current_ma2:
-            return None  # Price between MA1 and MA2
-    
-    # DSR RULE 6: No ranging markets
-    is_ranging = check_ranging_market(candles, ma1, ma2, current_idx)
-    if is_ranging:
-        return None
-    
-    # Must have rejection pattern
-    is_rejection, pattern_type = is_rejection_candle(current_candle)
-    if not is_rejection:
-        return None
-    
-    # DSR RULE 5: Price at or near MA1/MA2 (0.1% tolerance)
-    ma1_tolerance = current_ma1 * 0.001  # 0.1%
-    ma2_tolerance = current_ma2 * 0.001  # 0.1%
-    
-    # Check if any part of candle touched MA1 or MA2
-    touched_ma1 = (abs(current_high - current_ma1) <= ma1_tolerance or 
-                   abs(current_low - current_ma1) <= ma1_tolerance or 
-                   abs(current_close - current_ma1) <= ma1_tolerance)
-    
-    touched_ma2 = (abs(current_high - current_ma2) <= ma2_tolerance or 
-                   abs(current_low - current_ma2) <= ma2_tolerance or 
-                   abs(current_close - current_ma2) <= ma2_tolerance)
-    
-    if not (touched_ma1 or touched_ma2):
-        return None
-    
-    # Determine which MA level was touched
-    if touched_ma1:
-        ma_level = "MA1"
-    else:
-        ma_level = "MA2"
-    
-    # Generate signal based on bias
-    if bias == "BUY_BIAS":
-        signal_side = "BUY"
-        context = "MA1 above MA2 - uptrend confirmed"
-    else:
-        signal_side = "SELL" 
-        context = "MA1 below MA2 - downtrend confirmed"
-    
-    # Cooldown to prevent spam
-    last_signal_time = getattr(detect_signal, f'last_signal_{shorthand}', 0)
-    current_time = current_candle["epoch"]
-    
-    if current_time - last_signal_time < 1800:  # 30 minutes
-        return None
-    
-    setattr(detect_signal, f'last_signal_{shorthand}', current_time)
-    
-    if DEBUG:
-        print(f"VALID DSR: {signal_side} - {pattern_type} at {ma_level} - Price: {current_close:.2f}, MA1: {current_ma1:.2f}, MA2: {current_ma2:.2f}")
-    
-    return {
-        "symbol": shorthand,
-        "tf": tf,
-        "side": signal_side,
-        "pattern": pattern_type,
-        "ma_level": ma_level,
-        "ma_arrangement": "BULLISH_ARRANGEMENT" if bias == "BUY_BIAS" else "BEARISH_ARRANGEMENT",
-        "crossover": "NONE",
-        "context": context,
-        "price": current_close,
-        "ma1": current_ma1,
-        "ma2": current_ma2, 
-        "ma3": current_ma3,
-        "idx": current_idx,
-        "candles": candles,
-        "ma1_array": ma1,
-        "ma2_array": ma2,
-        "ma3_array": ma3
-    }
 
+    analysis_candles = candles[:-1]
+    current_candle = analysis_candles[-1]
 
-# -------------------------
-# Chart Generation
-# -------------------------
-def create_signal_chart(signal_data):
-    """Create chart for signal visualization"""
+    ma1_list, ma2_list, ma3_list = compute_mas(analysis_candles)
+    mas_objects = create_ma_objects(ma1_list, ma2_list, ma3_list)
+
+    if not mas_objects or mas_objects[-1] is None:
+        return None
+
+    current_ma = mas_objects[-1]
+    current_price = current_candle["close"]
+
+    if is_adaptive_ranging_market(mas_objects, analysis_candles):
+        return None
+
+    if detect_adaptive_price_spike(analysis_candles):
+        return None
+
+    trend = detect_adaptive_trend(mas_objects, current_price)
+    if trend == TrendDirection.RANGING:
+        return None
+
+    if not assess_ma_separation_quality(mas_objects):
+        return None
+
+    if len(analysis_candles) >= 2:
+        rejection_candle = analysis_candles[-2]
+        rejection_ma = mas_objects[-2] if len(mas_objects) >= 2 and mas_objects[-2] is not None else mas_objects[-1]
+        confirmation_candle = analysis_candles[-1]
+
+        rejection_found, pattern, ma_level = detect_rejection_at_ma(
+            rejection_candle, rejection_ma, trend, analysis_candles[:-2]
+        )
+
+        if rejection_found:
+            confirmation_valid = False
+
+            if trend == TrendDirection.UPTREND and confirmation_candle["close"] > confirmation_candle["open"]:
+                confirmation_valid = True
+            elif trend == TrendDirection.DOWNTREND and confirmation_candle["close"] < confirmation_candle["open"]:
+                confirmation_valid = True
+
+            if confirmation_valid:
+                confidence = calculate_signal_confidence(trend, pattern, mas_objects, analysis_candles)
+                signal_side = SignalType.BUY if trend == TrendDirection.UPTREND else SignalType.SELL
+
+                return {
+                    "symbol": shorthand,
+                    "tf": tf,
+                    "side": signal_side.value,
+                    "pattern": pattern.value,
+                    "ma_level": ma_level,
+                    "trend": trend.value,
+                    "confidence": confidence,
+                    "price": confirmation_candle["close"],
+                    "ma1": current_ma.ma1,
+                    "ma2": current_ma.ma2,
+                    "ma3": current_ma.ma3,
+                    "idx": len(analysis_candles) - 1,
+                    "candles": analysis_candles,
+                    "ma1_array": ma1_list,
+                    "ma2_array": ma2_list,
+                    "ma3_array": ma3_list
+                }
+
+    return None
+
+# Chart Generation with Arrow Fix
+def create_adaptive_signal_chart(signal_data):
     candles = signal_data["candles"]
     ma1, ma2, ma3 = signal_data["ma1_array"], signal_data["ma2_array"], signal_data["ma3_array"]
     signal_idx = signal_data["idx"]
-    
+
     n = len(candles)
     chart_start = max(0, n - LAST_N_CHART)
     chart_candles = candles[chart_start:]
-    
+
     plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(14, 10))
-    fig.patch.set_facecolor('black')
-    ax.set_facecolor('black')
-    
-    # Plot candlesticks
+    fig, ax = plt.subplots(figsize=(16, 10))
+    fig.patch.set_facecolor('#0a0a0a')
+    ax.set_facecolor('#0a0a0a')
+
     for i, candle in enumerate(chart_candles):
         o, h, l, c = candle["open"], candle["high"], candle["low"], candle["close"]
-        
+
         if c >= o:
-            body_color = "#00FF00"
-            edge_color = "#00AA00"
+            body_color = "#00ff88"
+            wick_color = "#00cc66"
         else:
-            body_color = "#FF0000"
-            edge_color = "#AA0000"
-        
+            body_color = "#ff4444"
+            wick_color = "#cc3333"
+
         ax.add_patch(Rectangle(
             (i - CANDLE_WIDTH/2, min(o, c)), 
             CANDLE_WIDTH, 
             max(abs(c - o), 1e-9),
             facecolor=body_color, 
-            edgecolor=edge_color, 
+            edgecolor=wick_color, 
             alpha=0.9,
-            linewidth=1
+            linewidth=1.2
         ))
-        
-        ax.plot([i, i], [l, h], color=edge_color, linewidth=1.2, alpha=0.8)
-    
-    # Plot moving averages
-    def plot_ma(ma_values, label, color, linewidth=2):
+
+        ax.plot([i, i], [l, h], color=wick_color, linewidth=1.5, alpha=0.8)
+
+    def plot_enhanced_ma(ma_values, label, color, linewidth=2.5):
         chart_ma = []
         for i in range(chart_start, n):
             if i < len(ma_values) and ma_values[i] is not None:
                 chart_ma.append(ma_values[i])
             else:
                 chart_ma.append(None)
+
         ax.plot(range(len(chart_candles)), chart_ma, 
-                color=color, linewidth=linewidth, label=label, alpha=0.9)
-    
-    plot_ma(ma1, "MA1 (SMMA HLC3-9)", "#FFFFFF", 2)
-    plot_ma(ma2, "MA2 (SMMA Close-19)", "#00BFFF", 2)
-    plot_ma(ma3, "MA3 (SMA MA2-25)", "#FF6347", 2)
-    
-    # Mark signal point
+                color=color, linewidth=linewidth, label=label,
+                alpha=0.9, zorder=5)
+
+    plot_enhanced_ma(ma1, "MA1 (SMMA HLC3-9) - Dynamic S/R", "#ffffff")
+    plot_enhanced_ma(ma2, "MA2 (SMMA Close-19) - Backup S/R", "#00bfff")
+    plot_enhanced_ma(ma3, "MA3 (SMA MA2-25) - Trend Filter", "#ff6347")
+
+    # ARROW VISUALIZATION
     signal_chart_idx = signal_idx - chart_start
     if 0 <= signal_chart_idx < len(chart_candles):
         signal_candle = chart_candles[signal_chart_idx]
-        signal_price = signal_candle["close"]
-        
+
+        price_range = max([c["high"] for c in chart_candles]) - min([c["low"] for c in chart_candles])
+        arrow_offset = price_range * 0.05
+
         if signal_data["side"] == "BUY":
-            marker_color = "#00FF00"
-            marker_symbol = "^"
+            arrow_color = "#00ff88"
+            arrow_start_y = signal_candle["low"] - arrow_offset
+            arrow_end_y = signal_candle["low"] + arrow_offset * 2
         else:
-            marker_color = "#FF0000" 
-            marker_symbol = "v"
-        
-        ax.scatter([signal_chart_idx], [signal_price], 
-                  color=marker_color, marker=marker_symbol, 
-                  s=300, edgecolor="#FFFFFF", linewidth=3, zorder=10)
-    
-    # Title with MA arrangement info
-    arrangement_emoji = "📈" if signal_data["ma_arrangement"] == "BULLISH_ARRANGEMENT" else "📉"
-    ax.set_title(f"{signal_data['symbol']} - {signal_data['side']} DSR Signal {arrangement_emoji}", 
-                fontsize=16, color='white', fontweight='bold', pad=20)
-    
-    legend = ax.legend(loc="upper left", frameon=True, facecolor='black', 
-                      edgecolor='white', fontsize=11)
-    legend.get_frame().set_alpha(0.8)
-    
-    ax.grid(True, alpha=0.3, color='gray', linestyle='--', linewidth=0.5)
+            arrow_color = "#ff4444"
+            arrow_start_y = signal_candle["high"] + arrow_offset
+            arrow_end_y = signal_candle["high"] - arrow_offset * 2
+
+        ax.plot([signal_chart_idx, signal_chart_idx], 
+               [arrow_start_y, arrow_end_y], 
+               color=arrow_color, linewidth=4, alpha=0.9, zorder=20)
+
+        if signal_data["side"] == "BUY":
+            ax.annotate('', xy=(signal_chart_idx, arrow_end_y), 
+                       xytext=(signal_chart_idx, arrow_end_y - arrow_offset * 0.3),
+                       arrowprops=dict(arrowstyle='->', lw=3, color=arrow_color),
+                       zorder=21)
+        else:
+            ax.annotate('', xy=(signal_chart_idx, arrow_end_y), 
+                       xytext=(signal_chart_idx, arrow_end_y + arrow_offset * 0.3),
+                       arrowprops=dict(arrowstyle='->', lw=3, color=arrow_color),
+                       zorder=21)
+
+        confidence_text = f"{signal_data['confidence']:.0%}"
+        ax.annotate(confidence_text, 
+                   xy=(signal_chart_idx, arrow_start_y),
+                   xytext=(15, 0), textcoords='offset points',
+                   fontsize=12, fontweight='bold', color='white',
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor=arrow_color, alpha=0.8),
+                   zorder=22)
+
+    trend_emoji = "📈" if signal_data["trend"] == "UPTREND" else "📉"
+    confidence_stars = "★" * min(5, int(signal_data["confidence"] * 5))
+
+    title = (f'{signal_data["symbol"]} - {signal_data["side"]} ADAPTIVE DSR {trend_emoji}\n'
+             f'Pattern: {signal_data["pattern"]} at {signal_data["ma_level"]} | '
+             f'Confidence: {confidence_stars} ({signal_data["confidence"]:.0%})')
+
+    ax.set_title(title, fontsize=16, color='white', fontweight='bold', pad=25)
+
+    legend = ax.legend(loc="upper left", frameon=True, facecolor='#1a1a1a', 
+                      edgecolor='white', fontsize=11, framealpha=0.9)
+    for text in legend.get_texts():
+        text.set_color('white')
+
+    ax.grid(True, alpha=0.2, color='gray', linestyle='--', linewidth=0.5)
     ax.tick_params(colors='white', labelsize=10)
-    
+
     for spine in ax.spines.values():
         spine.set_color('white')
-    
+        spine.set_linewidth(1.2)
+
+    trend_text = f"Trend: {signal_data['trend']}"
+    ax.text(0.02, 0.98, trend_text, transform=ax.transAxes,
+            fontsize=12, fontweight='bold', color='white',
+            verticalalignment='top',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='#333333', alpha=0.8))
+
     plt.tight_layout()
-    
+
     chart_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     plt.savefig(chart_file.name, 
-                dpi=150, 
+                dpi=200, 
                 bbox_inches="tight", 
-                facecolor='black',
+                facecolor='#0a0a0a',
                 edgecolor='none',
-                pad_inches=0.1)
+                pad_inches=0.2)
     plt.close()
     plt.style.use('default')
-    
+
     return chart_file.name
 
-# -------------------------
-# Main Execution
-# -------------------------
-def get_timeframe_for_symbol(shorthand):
-    return SYMBOL_TF_MAP.get(shorthand, TIMEFRAMES[0] if TIMEFRAMES else 300)
-
-def run_analysis():
-    """DSR analysis with MA crossover detection"""
+# Main Analysis Function
+def run_adaptive_analysis():
     signals_found = 0
-    
+
     for shorthand, deriv_symbol in SYMBOL_MAP.items():
         try:
             tf = get_timeframe_for_symbol(shorthand)
-            
+
             if DEBUG:
                 tf_display = f"{tf}s" if tf < 60 else f"{tf//60}m"
-                print(f"Analyzing {shorthand} on {tf_display}...")
-            
+                print(f"Analyzing {shorthand} ({deriv_symbol}) on {tf_display}...")
+
             candles = fetch_candles(deriv_symbol, tf)
-            if len(candles) < MIN_CANDLES:
+            if len(candles) < MIN_CANDLES + 1:
                 if DEBUG:
                     print(f"Insufficient candles for {shorthand}: {len(candles)}")
                 continue
-            
-            signal = detect_signal(candles, tf, shorthand)
+
+            signal = detect_adaptive_signal(candles, tf, shorthand)
             if not signal:
                 continue
-            
-            current_epoch = signal["candles"][signal["idx"]]["epoch"]
-            if already_sent(shorthand, tf, current_epoch, signal["side"]):
+
+            confirmation_epoch = signal["candles"][signal["idx"]]["epoch"]
+
+            current_time = int(time.time())
+            candle_close_time = confirmation_epoch + tf
+
+            if current_time < candle_close_time:
+                if DEBUG:
+                    print(f"{shorthand}: Confirmation candle not yet closed, skipping signal")
+                continue
+
+            if already_sent(shorthand, tf, confirmation_epoch, signal["side"]):
                 if DEBUG:
                     print(f"Signal already sent for {shorthand}")
                 continue
-            
-            # Create enhanced alert message with MA crossover info
+
             tf_display = f"{tf}s" if tf < 60 else f"{tf//60}m"
-            arrangement_emoji = "📈" if signal["ma_arrangement"] == "BULLISH_ARRANGEMENT" else "📉"
-            crossover_info = f" ({signal['crossover']})" if signal['crossover'] != "NONE" else ""
-            
-            caption = (f"🎯 {signal['symbol']} {tf_display} - {signal['side']} SIGNAL\n"
-                      f"{arrangement_emoji} MA Setup: {signal['ma_arrangement'].replace('_', ' ')}{crossover_info}\n" 
-                      f"🎨 Pattern: {signal['pattern']}\n"
-                      f"📍 Level: {signal['ma_level']} Dynamic S/R\n"
-                      f"💰 Price: {signal['price']:.5f}\n"
-                      f"📊 Context: {signal['context']}")
-            
-            chart_path = create_signal_chart(signal)
-            
+
+            confidence_level = signal["confidence"]
+            if confidence_level >= 0.8:
+                confidence_indicator = "🔥 HIGH"
+            elif confidence_level >= 0.6:
+                confidence_indicator = "⚡ MEDIUM"
+            else:
+                confidence_indicator = "💫 LOW"
+
+            trend_indicator = "🚀 STRONG" if signal["trend"] == "UPTREND" else "🔻 STRONG"
+
+            caption = (
+                f"🎯 ADAPTIVE DSR SIGNAL\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📊 {signal['symbol']} ({tf_display})\n"
+                f"📈 {signal['side']} Signal\n"
+                f"🎨 Pattern: {signal['pattern']}\n"
+                f"📍 Level: {signal['ma_level']} (Dynamic S/R)\n"
+                f"📉 Trend: {signal['trend']} {trend_indicator}\n"
+                f"💪 Confidence: {confidence_indicator} ({confidence_level:.0%})\n"
+                f"💰 Entry Price: {signal['price']:.5f}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🔹 MA1: {signal['ma1']:.5f}\n"
+                f"🔸 MA2: {signal['ma2']:.5f}\n"
+                f"🔺 MA3: {signal['ma3']:.5f}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🤖 Adaptive Algorithm\n"
+                f"⚙️ Market-Responsive Thresholds\n"
+                f"⏰ Signal: AFTER Confirmation Close"
+            )
+
+            chart_path = create_adaptive_signal_chart(signal)
+
             success, msg_id = send_telegram_photo(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, caption, chart_path)
-            
+
             if success:
-                mark_sent(shorthand, tf, current_epoch, signal["side"])
+                mark_sent(shorthand, tf, confirmation_epoch, signal["side"])
                 signals_found += 1
                 if DEBUG:
-                    print(f"DSR signal sent for {shorthand}: {signal['side']}")
-            
+                    print(f"PROPERLY TIMED Adaptive DSR signal sent for {shorthand}: {signal['side']} (Confidence: {confidence_level:.0%})")
+
             try:
                 os.unlink(chart_path)
             except:
                 pass
-                
+
         except Exception as e:
             if DEBUG:
                 print(f"Error analyzing {shorthand}: {e}")
                 traceback.print_exc()
-    
+
     if DEBUG:
-        print(f"Analysis complete. {signals_found} DSR signals found.")
+        print(f"Analysis complete. {signals_found} properly-timed adaptive DSR signals found.")
+
+    return signals_found
+
+def run_analysis():
+    return run_adaptive_analysis()
+
+# Validation Functions
+def validate_strategy_components():
+    print("Validating Adaptive DSR Strategy Components...")
+    print("=" * 50)
+
+    sample_candles = []
+    base_price = 1000.0
+
+    for i in range(100):
+        price_change = 0.1 if i < 50 else -0.1
+        base_price += price_change
+
+        candle = {
+            "epoch": 1640995200 + i * 300,
+            "open": base_price - 0.05,
+            "high": base_price + 0.1,
+            "low": base_price - 0.1,
+            "close": base_price
+        }
+        sample_candles.append(candle)
+
+    ma1, ma2, ma3 = compute_mas(sample_candles)
+    mas_objects = create_ma_objects(ma1, ma2, ma3)
+
+    print(f"✓ MA calculations: {len([ma for ma in mas_objects if ma is not None])} valid periods")
+
+    if mas_objects and mas_objects[-1]:
+        trend = detect_adaptive_trend(mas_objects, sample_candles[-1]["close"])
+        print(f"✓ Trend detection: {trend.value}")
+
+    ranging = is_adaptive_ranging_market(mas_objects, sample_candles)
+    spike = detect_adaptive_price_spike(sample_candles)
+    separation = assess_ma_separation_quality(mas_objects)
+
+    print(f"✓ Market filters - Ranging: {ranging}, Spike: {spike}, Separation: {separation}")
+    print("Strategy validation complete.")
 
 if __name__ == "__main__":
     try:
+        if DEBUG:
+            validate_strategy_components()
+            print("\n" + "="*60 + "\n")
+
         run_analysis()
+
     except Exception as e:
         print(f"Critical error: {e}")
-        traceback.print_exc()
+        if DEBUG:
+            traceback.print_exc()
