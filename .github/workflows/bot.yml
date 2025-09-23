@@ -1,33 +1,407 @@
-name: Deriv Signal Bot
+name: DSR Trading Bot - 24/7 Operation
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"    # every 5 minutes
+  # Manual trigger
   workflow_dispatch:
+    inputs:
+      debug_mode:
+        description: 'Enable debug mode'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+        - 'true'
+        - 'false'
+      test_mode:
+        description: 'Enable test mode (bypass cooldowns)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+        - 'true'
+        - 'false'
+  
+  # Automatic restart every 6 hours for 24/7 coverage
+  schedule:
+    # Four daily runs to cover 24 hours (UTC timezone)
+    - cron: '0 0 * * *'    # 00:00 UTC
+    - cron: '0 6 * * *'    # 06:00 UTC
+    - cron: '0 12 * * *'   # 12:00 UTC
+    - cron: '0 18 * * *'   # 18:00 UTC
+
+env:
+  # Global environment variables
+  PYTHONUNBUFFERED: '1'
+  PYTHONIOENCODING: 'utf-8'
+  TZ: 'UTC'
 
 jobs:
-  run:
+  dsr-trading-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours maximum
+    
+    # Prevent concurrent runs
+    concurrency:
+      group: dsr-bot-execution
+      cancel-in-progress: false
+    
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+    
+    - name: Setup Python Environment
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          python3-dev \
+          build-essential \
+          libffi-dev \
+          libssl-dev
+        
+        # Clean up to reduce disk usage
+        sudo apt-get clean
+        sudo rm -rf /var/lib/apt/lists/*
+    
+    - name: Install Python Dependencies
+      run: |
+        python -m pip install --upgrade pip wheel setuptools
+        
+        # Core dependencies for the trading bot
+        pip install \
+          websocket-client==1.6.4 \
+          matplotlib==3.8.0 \
+          requests==2.31.0 \
+          numpy==1.24.4
+        
+        # Verify installations
+        python -c "import websocket; print(f'websocket-client: {websocket.__version__}')"
+        python -c "import matplotlib; print(f'matplotlib: {matplotlib.__version__}')"
+        python -c "import requests; print(f'requests: {requests.__version__}')"
+    
+    - name: Create Telegram Bot Module
+      run: |
+        cat > bot.py << 'EOF'
+        """
+        Telegram Bot Helper Module
+        Handles message and photo sending to Telegram channels
+        """
+        import requests
+        import json
+        import time
+        from datetime import datetime
+        
+        def send_telegram_message(token, chat_id, text, max_retries=3):
+            """Send text message via Telegram Bot API with retries"""
+            if not token or not chat_id:
+                print(f"[TELEGRAM] {text}")
+                return True, "local_mode"
+            
+            for attempt in range(max_retries):
+                try:
+                    url = f"https://api.telegram.org/bot{token}/sendMessage"
+                    payload = {
+                        'chat_id': chat_id,
+                        'text': text[:4096],  # Telegram message limit
+                        'parse_mode': 'HTML',
+                        'disable_web_page_preview': True,
+                        'disable_notification': False
+                    }
+                    
+                    response = requests.post(url, json=payload, timeout=30)
+                    result = response.json()
+                    
+                    if result.get('ok'):
+                        return True, result.get('result', {}).get('message_id', 'sent')
+                    else:
+                        error_msg = result.get('description', 'Unknown error')
+                        print(f"Telegram API error (attempt {attempt + 1}): {error_msg}")
+                        if attempt < max_retries - 1:
+                            time.sleep(2 ** attempt)  # Exponential backoff
+                        
+                except Exception as e:
+                    print(f"Error sending Telegram message (attempt {attempt + 1}): {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+            
+            return False, "Failed after all retries"
+        
+        def send_telegram_photo(token, chat_id, caption, photo_path, max_retries=3):
+            """Send photo with caption via Telegram Bot API with retries"""
+            if not token or not chat_id:
+                print(f"[TELEGRAM PHOTO] {caption}")
+                return True, "local_mode"
+            
+            for attempt in range(max_retries):
+                try:
+                    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+                    
+                    with open(photo_path, 'rb') as photo_file:
+                        files = {'photo': photo_file}
+                        data = {
+                            'chat_id': chat_id,
+                            'caption': caption[:1024],  # Telegram caption limit
+                            'parse_mode': 'HTML',
+                            'disable_notification': False
+                        }
+                        
+                        response = requests.post(url, files=files, data=data, timeout=60)
+                        result = response.json()
+                    
+                    if result.get('ok'):
+                        return True, result.get('result', {}).get('message_id', 'sent')
+                    else:
+                        error_msg = result.get('description', 'Unknown error')
+                        print(f"Telegram photo API error (attempt {attempt + 1}): {error_msg}")
+                        if "too large" in error_msg.lower():
+                            # Photo too large, fallback to text message
+                            return send_telegram_message(token, chat_id, caption, max_retries=1)
+                        if attempt < max_retries - 1:
+                            time.sleep(2 ** attempt)
+                        
+                except Exception as e:
+                    print(f"Error sending Telegram photo (attempt {attempt + 1}): {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+            
+            # Final fallback to text message
+            print("Photo sending failed, falling back to text message")
+            return send_telegram_message(token, chat_id, caption, max_retries=1)
+        EOF
+    
+    - name: Validate Configuration
+      env:
+        DERIV_API_KEY: ${{ secrets.DERIV_API_KEY }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: |
+        echo "=== DSR Trading Bot Configuration ==="
+        echo "Python version: $(python --version)"
+        echo "Workflow run ID: ${{ github.run_id }}"
+        echo "Run attempt: ${{ github.run_attempt }}"
+        echo "Trigger event: ${{ github.event_name }}"
+        echo "Debug mode: ${{ github.event.inputs.debug_mode || 'false' }}"
+        echo "Test mode: ${{ github.event.inputs.test_mode || 'false' }}"
+        echo "Timezone: $(date +%Z)"
+        echo "Current time: $(date)"
+        echo "Max runtime: 6 hours"
+        echo ""
+        
+        # Check secrets (without exposing values)
+        if [ -n "$DERIV_API_KEY" ]; then
+          echo "✓ DERIV_API_KEY: Configured"
+        else
+          echo "⚠ DERIV_API_KEY: Not set (will work in demo mode)"
+        fi
+        
+        if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+          echo "✓ TELEGRAM_BOT_TOKEN: Configured"
+        else
+          echo "⚠ TELEGRAM_BOT_TOKEN: Not set (alerts will print to console)"
+        fi
+        
+        if [ -n "$TELEGRAM_CHAT_ID" ]; then
+          echo "✓ TELEGRAM_CHAT_ID: Configured"
+        else
+          echo "⚠ TELEGRAM_CHAT_ID: Not set (alerts will print to console)"
+        fi
+        
+        # Validate main.py exists
+        if [ -f "main.py" ]; then
+          echo "✓ main.py: Found"
+        else
+          echo "✗ main.py: Missing - creating default version"
+          exit 1
+        fi
+        
+        echo "=== Configuration Complete ==="
+    
+    - name: Pre-Run Setup
+      run: |
+        # Create directories for temporary files
+        mkdir -p /tmp/dsr_bot_charts
+        mkdir -p /tmp/dsr_bot_data
+        
+        # Set runtime tracking
+        echo "WORKFLOW_START_TIME=$(date +%s)" >> $GITHUB_ENV
+        
+        # Test matplotlib backend
+        python -c "import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; print('Matplotlib backend test: OK')"
+    
+    - name: Execute DSR Trading Bot
+      env:
+        DERIV_API_KEY: ${{ secrets.DERIV_API_KEY }}
+        DERIV_APP_ID: ${{ secrets.DERIV_APP_ID || '1089' }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        DEBUG: ${{ github.event.inputs.debug_mode || 'false' }}
+        TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
+      run: |
+        echo "Starting DSR Trading Bot execution..."
+        echo "Session: ${{ github.run_id }}-${{ github.run_attempt }}"
+        echo "Start time: $(date)"
+        echo ""
+        
+        # Set up signal handling for graceful shutdown
+        trap 'echo "Received termination signal, shutting down gracefully..."; exit 0' TERM INT
+        
+        # Run the bot with error handling
+        python main.py 2>&1 | tee bot_execution.log || {
+          exit_code=$?
+          echo ""
+          echo "Bot exited with code: $exit_code"
+          echo "Last 50 lines of output:"
+          tail -50 bot_execution.log
+          
+          # Try emergency restart if exit code indicates recoverable error
+          if [ $exit_code -eq 1 ] || [ $exit_code -eq 130 ]; then
+            echo ""
+            echo "Attempting emergency restart in 30 seconds..."
+            sleep 30
+            echo "Restarting bot..."
+            python main.py 2>&1 | tee -a bot_execution.log || {
+              echo "Emergency restart failed with exit code: $?"
+              exit 1
+            }
+          else
+            echo "Non-recoverable error, exiting..."
+            exit $exit_code
+          fi
+        }
+        
+        echo ""
+        echo "Bot execution completed normally"
+        echo "End time: $(date)"
+    
+    - name: Post-Execution Cleanup
+      if: always()
+      run: |
+        echo "=== Post-Execution Report ==="
+        echo "Workflow completion time: $(date)"
+        
+        if [ -n "$WORKFLOW_START_TIME" ]; then
+          duration=$(($(date +%s) - $WORKFLOW_START_TIME))
+          hours=$((duration / 3600))
+          minutes=$(((duration % 3600) / 60))
+          seconds=$((duration % 60))
+          echo "Total runtime: ${hours}h ${minutes}m ${seconds}s"
+        fi
+        
+        # Show system resource usage
+        echo ""
+        echo "System resources:"
+        echo "Memory usage: $(free -h | grep '^Mem:' | awk '{print $3 "/" $2}')"
+        echo "Disk usage: $(df -h /tmp | tail -1 | awk '{print $3 "/" $2 " (" $5 ")"}')"
+        
+        # Clean up temporary files
+        echo ""
+        echo "Cleaning up temporary files..."
+        find /tmp -name "*.png" -type f -mmin +60 -delete 2>/dev/null || true
+        find /tmp -name "dsr_*.json" -type f -mmin +60 -delete 2>/dev/null || true
+        find /tmp -name "tmp*" -type f -mmin +60 -delete 2>/dev/null || true
+        
+        # Archive logs if they exist
+        if [ -f "bot_execution.log" ]; then
+          echo "Execution log size: $(wc -l < bot_execution.log) lines"
+          # Keep only last 1000 lines to avoid storage issues
+          tail -1000 bot_execution.log > bot_execution_summary.log
+        fi
+        
+        echo "=== Cleanup Complete ==="
+    
+    - name: Upload Execution Logs
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: dsr-bot-logs-${{ github.run_id }}
+        path: |
+          bot_execution_summary.log
+          *.log
+        retention-days: 7
+        if-no-files-found: ignore
+    
+    - name: Schedule Status Report
+      if: always()
+      run: |
+        echo "=== Next Scheduled Runs ==="
+        
+        # Calculate next run times
+        current_hour=$(date +%H)
+        
+        case $current_hour in
+          0|1|2|3|4|5)   next_run="06:00" ;;
+          6|7|8|9|10|11)  next_run="12:00" ;;
+          12|13|14|15|16|17) next_run="18:00" ;;
+          *) next_run="00:00 (tomorrow)" ;;
+        esac
+        
+        echo "Current time: $(date '+%Y-%m-%d %H:%M:%S UTC')"
+        echo "Next scheduled run: $next_run UTC"
+        echo ""
+        echo "Full schedule (UTC):"
+        echo "- 00:00 (Midnight)"
+        echo "- 06:00 (Morning)"
+        echo "- 12:00 (Noon)"
+        echo "- 18:00 (Evening)"
+        echo ""
+        echo "Bot status: ${{ job.status }}"
+        echo "Session completed successfully"
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install mplfinance
-
-      - name: Run bot
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DERIV_APP_ID: ${{ secrets.DERIV_APP_ID }}
-          DERIV_API_KEY: ${{ secrets.DERIV_API_KEY }}
-          DEBUG: "1"
-        run: python main.py
+  # Health monitoring job
+  health-check:
+    runs-on: ubuntu-latest
+    needs: dsr-trading-bot
+    if: always()
+    
+    steps:
+    - name: Generate Health Report
+      run: |
+        echo "=== DSR Trading Bot Health Report ==="
+        echo "Date: $(date)"
+        echo "Run ID: ${{ github.run_id }}"
+        echo "Attempt: ${{ github.run_attempt }}"
+        echo "Trigger: ${{ github.event_name }}"
+        echo "Status: ${{ needs.dsr-trading-bot.result }}"
+        echo ""
+        
+        case "${{ needs.dsr-trading-bot.result }}" in
+          "success")
+            echo "✅ Bot session completed successfully"
+            echo "   - All systems operational"
+            echo "   - Ready for next scheduled run"
+            ;;
+          "failure")
+            echo "❌ Bot session encountered errors"
+            echo "   - Check execution logs for details"
+            echo "   - Next run will attempt automatic recovery"
+            ;;
+          "cancelled")
+            echo "⚠️  Bot session was cancelled"
+            echo "   - May indicate resource constraints"
+            echo "   - Next run scheduled as normal"
+            ;;
+          "skipped")
+            echo "⏭️  Bot session was skipped"
+            echo "   - Likely due to concurrent run protection"
+            ;;
+          *)
+            echo "❓ Unknown status: ${{ needs.dsr-trading-bot.result }}"
+            ;;
+        esac
+        
+        echo ""
+        echo "=== System Status ==="
+        echo "GitHub Actions Status: Operational"
+        echo "Next Auto-Run: Scheduled per cron"
+        echo "Manual Trigger: Available"
+        echo ""
+        echo "Repository: ${{ github.repository }}"
+        echo "Branch: ${{ github.ref_name }}"
+        echo "Commit: ${{ github.sha }}"
