@@ -191,7 +191,7 @@ def detect_adaptive_trend(mas_objects, current_price):
     lookback_mas = mas_objects[-min(LOOKBACK_PERIOD, len(mas_objects)):]
     valid_mas = [ma for ma in lookback_mas if ma is not None]
 
-    if len(valid_mas) < LOOKBACK_PERIOD * 0.45
+    if len(valid_mas) < LOOKBACK_PERIOD * 0.45:
         return TrendDirection.RANGING
 
     for ma in valid_mas:
