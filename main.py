@@ -45,6 +45,7 @@ SYMBOL_MAP = {
     "Jump10": "JD10", "Jump25": "JD25", "Jump50": "JD50", 
     "Jump75": "JD75", "Jump100": "JD100",
     "V75(1s)": "1s_V75",
+}
 
 SYMBOL_TF_MAP = {
     "V75(1s)": 1,
