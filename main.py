@@ -508,9 +508,8 @@ class RealTimeDSRBot:
         """Process initial historical candle data"""
         try:
             req_id = data.get('req_id', '')
-            if not req_id.startswith('hist_'):
-                return
-                
+            if req_id not in self.subscriptions:
+               return
             symbol_name = self.subscriptions.get(req_id, 'Unknown')
             
             if 'candles' not in data:
