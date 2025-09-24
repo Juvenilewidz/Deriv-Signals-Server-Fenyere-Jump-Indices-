@@ -468,11 +468,12 @@ class RealTimeDSRBot:
         print(f"Subscription setup complete. Monitoring {len(SYMBOLS)} symbols.")
     
     def subscribe_to_candles(self, ws, deriv_symbol, symbol_name):
-        """Subscribe to candle data for a symbol"""
-        # Use simple, clean request IDs
-        history_req_id = f"hist_{deriv_symbol}_{int(time.time())}"
-        stream_req_id = f"stream_{deriv_symbol}_{int(time.time())}"
-        
+    """Subscribe to candle data for a symbol"""
+    # Use integer request IDs (Deriv API requirement)
+    history_req_id = int(time.time() * 1000)  # milliseconds timestamp
+    stream_req_id = int(time.time() * 1000) + 1
+
+# ======================================================
         # First get historical data
         history_request = {
             "ticks_history": deriv_symbol,
