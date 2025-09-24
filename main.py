@@ -469,20 +469,25 @@ class RealTimeDSRBot:
     
     def subscribe_to_candles(self, ws, deriv_symbol, symbol_name):
         """Subscribe to candle data for a symbol"""
-        subscription_id = f"{deriv_symbol}_{CANDLE_TIMEFRAME}"
+        # Use simple, clean request IDs
+        history_req_id = f"hist_{deriv_symbol}_{int(time.time())}"
+        stream_req_id = f"stream_{deriv_symbol}_{int(time.time())}"
         
         # First get historical data
         history_request = {
             "ticks_history": deriv_symbol,
             "style": "candles",
             "granularity": CANDLE_TIMEFRAME,
-            "count": 150,  # Get more history for better MA calculation
+            "count": 150,
             "end": "latest",
-            "req_id": f"history_{subscription_id}"
+            "req_id": history_req_id
         }
         
         ws.send(json.dumps(history_request))
-        self.subscriptions[f"history_{subscription_id}"] = symbol_name
+        self.subscriptions[history_req_id] = symbol_name
+        
+        # Wait a moment before subscribing to live stream
+        time.sleep(0.5)
         
         # Then subscribe to live updates
         subscription_request = {
@@ -490,11 +495,11 @@ class RealTimeDSRBot:
             "style": "candles", 
             "granularity": CANDLE_TIMEFRAME,
             "subscribe": 1,
-            "req_id": subscription_id
+            "req_id": stream_req_id
         }
         
         ws.send(json.dumps(subscription_request))
-        self.subscriptions[subscription_id] = symbol_name
+        self.subscriptions[stream_req_id] = symbol_name
         
         print(f"Requested history and subscription for {symbol_name} ({deriv_symbol})")
     
@@ -502,12 +507,13 @@ class RealTimeDSRBot:
         """Process initial historical candle data"""
         try:
             req_id = data.get('req_id', '')
-            if not req_id.startswith('history_'):
+            if not req_id.startswith('hist_'):
                 return
                 
             symbol_name = self.subscriptions.get(req_id, 'Unknown')
             
             if 'candles' not in data:
+                print(f"No candles in history response for {symbol_name}")
                 return
             
             print(f"Processing {len(data['candles'])} historical candles for {symbol_name}")
@@ -516,17 +522,29 @@ class RealTimeDSRBot:
             self.candle_data[symbol_name].clear()
             
             # Process historical candles
+            candle_count = 0
             for candle_raw in data['candles']:
-                candle = {
-                    'epoch': int(candle_raw['epoch']),
-                    'open': float(candle_raw['open']),
-                    'high': float(candle_raw['high']),
-                    'low': float(candle_raw['low']),
-                    'close': float(candle_raw['close'])
-                }
-                self.candle_data[symbol_name].append(candle)
+                try:
+                    candle = {
+                        'epoch': int(candle_raw['epoch']),
+                        'open': float(candle_raw['open']),
+                        'high': float(candle_raw['high']),
+                        'low': float(candle_raw['low']),
+                        'close': float(candle_raw['close'])
+                    }
+                    self.candle_data[symbol_name].append(candle)
+                    candle_count += 1
+                except (KeyError, ValueError) as e:
+                    print(f"Invalid candle data: {e}")
+                    continue
             
-            print(f"Loaded {len(self.candle_data[symbol_name])} candles for {symbol_name}")
+            print(f"Successfully loaded {candle_count} candles for {symbol_name}")
+            
+            # Check if we have enough data for analysis
+            if candle_count >= 30:
+                print(f"{symbol_name} ready for signal analysis")
+            else:
+                print(f"Warning: {symbol_name} has only {candle_count} candles (need 30+ for analysis)")
             
         except Exception as e:
             print(f"Error processing historical data: {e}")
