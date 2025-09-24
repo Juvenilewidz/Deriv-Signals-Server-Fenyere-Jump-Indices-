@@ -357,41 +357,69 @@ class RealTimeDSRBot:
         self.subscriptions = {}
         self.running = True
         self.start_time = time.time()
+        self.connected = False
+        self.authorized = False
+        self.subscribed_symbols = set()
+        self.reconnect_count = 0
+        self.max_reconnects = 50
         
     def on_open(self, ws):
         """WebSocket connection opened"""
         print(f"[{datetime.now()}] Connected to Deriv WebSocket")
+        self.connected = True
+        self.authorized = False
+        
+        # Wait a moment for connection to stabilize
+        time.sleep(1)
         
         # Authorize if API key is provided
         if DERIV_API_KEY:
-            ws.send(json.dumps({"authorize": DERIV_API_KEY}))
-        
-        # Subscribe to candle streams for all symbols
-        for symbol_name, deriv_symbol in SYMBOLS.items():
-            self.subscribe_to_candles(ws, deriv_symbol, symbol_name)
+            auth_request = {"authorize": DERIV_API_KEY}
+            ws.send(json.dumps(auth_request))
+            print("Sent authorization request...")
+        else:
+            # No API key, proceed directly to subscriptions
+            self.authorized = True
+            self.setup_subscriptions(ws)
     
     def on_message(self, ws, message):
         """Process incoming WebSocket messages"""
         try:
             data = json.loads(message)
+            msg_type = data.get('msg_type', 'unknown')
             
             if DEBUG:
-                print(f"[{datetime.now()}] Received: {data.get('msg_type', 'unknown')}")
+                print(f"[{datetime.now()}] Received: {msg_type}")
             
             # Handle authorization response
-            if data.get('msg_type') == 'authorize':
+            if msg_type == 'authorize':
                 if data.get('error'):
                     print(f"Authorization failed: {data['error']['message']}")
+                    self.authorized = False
                 else:
                     print("Successfully authorized")
+                    self.authorized = True
+                    # Now setup subscriptions after successful auth
+                    self.setup_subscriptions(ws)
             
-            # Handle candle data
-            elif data.get('msg_type') == 'candles':
+            # Handle initial candle history
+            elif msg_type == 'history':
+                self.process_initial_history(data)
+            
+            # Handle streaming candle data
+            elif msg_type == 'candles':
                 self.process_candle_data(data)
             
             # Handle subscription confirmations
-            elif data.get('msg_type') == 'candles_subscription':
-                print(f"Subscribed to candles for {data.get('echo_req', {}).get('ticks_history', 'unknown')}")
+            elif msg_type == 'candles_subscription' or msg_type == 'history_subscription':
+                symbol = data.get('echo_req', {}).get('ticks_history', 'unknown')
+                print(f"Successfully subscribed to {symbol}")
+                self.subscribed_symbols.add(symbol)
+            
+            # Handle errors
+            elif data.get('error'):
+                error_msg = data['error'].get('message', 'Unknown error')
+                print(f"API Error: {error_msg}")
         
         except Exception as e:
             print(f"Error processing message: {e}")
@@ -401,36 +429,109 @@ class RealTimeDSRBot:
     def on_error(self, ws, error):
         """Handle WebSocket errors"""
         print(f"WebSocket error: {error}")
+        self.connected = False
     
     def on_close(self, ws, close_status_code, close_msg):
         """Handle WebSocket close"""
         print(f"[{datetime.now()}] WebSocket connection closed: {close_status_code} - {close_msg}")
+        self.connected = False
+        self.authorized = False
+        self.subscribed_symbols.clear()
         
         # Attempt to reconnect if we're still supposed to be running
         if self.running and (time.time() - self.start_time) < MAX_RUN_TIME:
-            print("Attempting to reconnect in 5 seconds...")
-            time.sleep(5)
-            self.connect()
+            self.reconnect_count += 1
+            if self.reconnect_count < self.max_reconnects:
+                reconnect_delay = min(30, 5 + self.reconnect_count * 2)  # Progressive delay
+                print(f"Attempting to reconnect in {reconnect_delay} seconds... (attempt {self.reconnect_count})")
+                time.sleep(reconnect_delay)
+                self.connect()
+            else:
+                print("Max reconnection attempts reached. Stopping bot.")
+                self.running = False
+    
+    def setup_subscriptions(self, ws):
+        """Setup all symbol subscriptions after connection is stable"""
+        if not (self.connected and self.authorized):
+            return
+            
+        print("Setting up symbol subscriptions...")
+        time.sleep(2)  # Wait for connection to fully stabilize
+        
+        for symbol_name, deriv_symbol in SYMBOLS.items():
+            try:
+                self.subscribe_to_candles(ws, deriv_symbol, symbol_name)
+                time.sleep(1)  # Stagger subscription requests
+            except Exception as e:
+                print(f"Failed to subscribe to {symbol_name}: {e}")
+                
+        print(f"Subscription setup complete. Monitoring {len(SYMBOLS)} symbols.")
     
     def subscribe_to_candles(self, ws, deriv_symbol, symbol_name):
         """Subscribe to candle data for a symbol"""
         subscription_id = f"{deriv_symbol}_{CANDLE_TIMEFRAME}"
         
-        request = {
+        # First get historical data
+        history_request = {
             "ticks_history": deriv_symbol,
             "style": "candles",
             "granularity": CANDLE_TIMEFRAME,
-            "count": 100,
+            "count": 150,  # Get more history for better MA calculation
             "end": "latest",
+            "req_id": f"history_{subscription_id}"
+        }
+        
+        ws.send(json.dumps(history_request))
+        self.subscriptions[f"history_{subscription_id}"] = symbol_name
+        
+        # Then subscribe to live updates
+        subscription_request = {
+            "ticks_history": deriv_symbol,
+            "style": "candles", 
+            "granularity": CANDLE_TIMEFRAME,
             "subscribe": 1,
             "req_id": subscription_id
         }
         
-        ws.send(json.dumps(request))
+        ws.send(json.dumps(subscription_request))
         self.subscriptions[subscription_id] = symbol_name
         
-        if DEBUG:
-            print(f"Subscribed to {symbol_name} ({deriv_symbol}) candles")
+        print(f"Requested history and subscription for {symbol_name} ({deriv_symbol})")
+    
+    def process_initial_history(self, data):
+        """Process initial historical candle data"""
+        try:
+            req_id = data.get('req_id', '')
+            if not req_id.startswith('history_'):
+                return
+                
+            symbol_name = self.subscriptions.get(req_id, 'Unknown')
+            
+            if 'candles' not in data:
+                return
+            
+            print(f"Processing {len(data['candles'])} historical candles for {symbol_name}")
+            
+            # Clear existing data for this symbol
+            self.candle_data[symbol_name].clear()
+            
+            # Process historical candles
+            for candle_raw in data['candles']:
+                candle = {
+                    'epoch': int(candle_raw['epoch']),
+                    'open': float(candle_raw['open']),
+                    'high': float(candle_raw['high']),
+                    'low': float(candle_raw['low']),
+                    'close': float(candle_raw['close'])
+                }
+                self.candle_data[symbol_name].append(candle)
+            
+            print(f"Loaded {len(self.candle_data[symbol_name])} candles for {symbol_name}")
+            
+        except Exception as e:
+            print(f"Error processing historical data: {e}")
+            if DEBUG:
+                traceback.print_exc()
     
     def process_candle_data(self, data):
         """Process incoming candle data and check for signals"""
@@ -513,8 +614,10 @@ class RealTimeDSRBot:
             send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, alert_text)
     
     def connect(self):
-        """Establish WebSocket connection"""
+        """Establish WebSocket connection with improved error handling"""
         try:
+            print(f"[{datetime.now()}] Attempting WebSocket connection (attempt {self.reconnect_count + 1})...")
+            
             self.ws = websocket.WebSocketApp(
                 DERIV_WS_URL,
                 on_open=self.on_open,
@@ -523,11 +626,16 @@ class RealTimeDSRBot:
                 on_close=self.on_close
             )
             
-            # Start connection in a separate thread to allow for timeout monitoring
-            self.ws.run_forever()
+            # Use run_forever with timeout to prevent hanging
+            self.ws.run_forever(
+                ping_interval=30,  # Send ping every 30 seconds
+                ping_timeout=10,   # Wait 10 seconds for pong
+                reconnect=5        # Reconnect delay
+            )
             
         except Exception as e:
             print(f"Connection error: {e}")
+            self.connected = False
     
     def run(self):
         """Main bot execution"""
