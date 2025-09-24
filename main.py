@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Real-time DSR Trading Bot with Persistent WebSocket Connection - PROPER INTEGER FIX
-- Uses sequential integer req_id values as required by Deriv API
-- Proper request tracking and error handling
-- Enhanced connection stability
+Real-time DSR Trading Bot with Persistent WebSocket Connection
+- Maintains continuous connection to Deriv WebSocket
+- Processes live tick/candle streams without reconnecting
+- Designed for 6-hour GitHub Actions runs with auto-restart
+- Real-time signal detection and analysis
 """
 
 import os, json, time, threading, traceback
@@ -90,6 +91,7 @@ def calculate_mas(candle_data):
     ma2 = smma(closes, 15)
     
     # MA3: SMA of MA2 values, period 20
+    # We need to calculate MA2 for the last 20 candles to get MA3
     ma2_values = []
     for i in range(len(candle_data)):
         if i >= 14:  # MA2 needs at least 15 values
@@ -353,7 +355,6 @@ class RealTimeDSRBot:
         self.candle_data = defaultdict(lambda: deque(maxlen=MAX_CANDLES_MEMORY))
         self.last_signals = defaultdict(int)
         self.subscriptions = {}
-        self.req_id_to_symbol = {}  # Map req_id to symbol for tracking
         self.running = True
         self.start_time = time.time()
         self.connected = False
@@ -362,14 +363,6 @@ class RealTimeDSRBot:
         self.reconnect_count = 0
         self.max_reconnects = 50
         
-        # Sequential req_id counter - starts from 1000 for clarity
-        self.req_id_counter = 1000
-        
-    def get_next_req_id(self):
-        """Generate sequential integer req_id as required by Deriv API"""
-        self.req_id_counter += 1
-        return self.req_id_counter
-    
     def on_open(self, ws):
         """WebSocket connection opened"""
         print(f"[{datetime.now()}] Connected to Deriv WebSocket")
@@ -381,13 +374,9 @@ class RealTimeDSRBot:
         
         # Authorize if API key is provided
         if DERIV_API_KEY:
-            auth_req_id = self.get_next_req_id()
-            auth_request = {
-                "authorize": DERIV_API_KEY,
-                "req_id": auth_req_id
-            }
+            auth_request = {"authorize": DERIV_API_KEY}
             ws.send(json.dumps(auth_request))
-            print(f"Sent authorization request with req_id: {auth_req_id}")
+            print("Sent authorization request...")
         else:
             # No API key, proceed directly to subscriptions
             self.authorized = True
@@ -398,10 +387,9 @@ class RealTimeDSRBot:
         try:
             data = json.loads(message)
             msg_type = data.get('msg_type', 'unknown')
-            req_id = data.get('req_id', None)
             
             if DEBUG:
-                print(f"[{datetime.now()}] Received: {msg_type} (req_id: {req_id})")
+                print(f"[{datetime.now()}] Received: {msg_type}")
             
             # Handle authorization response
             if msg_type == 'authorize':
@@ -409,7 +397,7 @@ class RealTimeDSRBot:
                     print(f"Authorization failed: {data['error']['message']}")
                     self.authorized = False
                 else:
-                    print("✅ Successfully authorized")
+                    print("Successfully authorized")
                     self.authorized = True
                     # Now setup subscriptions after successful auth
                     self.setup_subscriptions(ws)
@@ -423,16 +411,15 @@ class RealTimeDSRBot:
                 self.process_candle_data(data)
             
             # Handle subscription confirmations
-            elif msg_type == 'candles_subscription':
-                symbol_name = self.req_id_to_symbol.get(req_id, f"Unknown({req_id})")
-                print(f"✅ Successfully subscribed to live candles for {symbol_name}")
-                self.subscribed_symbols.add(symbol_name)
+            elif msg_type == 'candles_subscription' or msg_type == 'history_subscription':
+                symbol = data.get('echo_req', {}).get('ticks_history', 'unknown')
+                print(f"Successfully subscribed to {symbol}")
+                self.subscribed_symbols.add(symbol)
             
             # Handle errors
             elif data.get('error'):
                 error_msg = data['error'].get('message', 'Unknown error')
-                error_code = data['error'].get('code', 'Unknown code')
-                print(f"❌ API Error [{error_code}]: {error_msg} (req_id: {req_id})")
+                print(f"API Error: {error_msg}")
         
         except Exception as e:
             print(f"Error processing message: {e}")
@@ -474,19 +461,19 @@ class RealTimeDSRBot:
         for symbol_name, deriv_symbol in SYMBOLS.items():
             try:
                 self.subscribe_to_candles(ws, deriv_symbol, symbol_name)
-                time.sleep(2)  # Stagger requests to avoid rate limiting
+                time.sleep(1)  # Stagger subscription requests
             except Exception as e:
                 print(f"Failed to subscribe to {symbol_name}: {e}")
                 
         print(f"Subscription setup complete. Monitoring {len(SYMBOLS)} symbols.")
     
     def subscribe_to_candles(self, ws, deriv_symbol, symbol_name):
-        """Subscribe to candle data for a symbol using proper integer req_ids"""
+        """Subscribe to candle data for a symbol"""
+        # Use simple, clean request IDs
+        history_req_id = f"hist_{deriv_symbol}_{int(time.time())}"
+        stream_req_id = f"stream_{deriv_symbol}_{int(time.time())}"
         
-        # Get historical data first
-        history_req_id = self.get_next_req_id()
-        self.req_id_to_symbol[history_req_id] = symbol_name
-        
+        # First get historical data
         history_request = {
             "ticks_history": deriv_symbol,
             "style": "candles",
@@ -496,16 +483,13 @@ class RealTimeDSRBot:
             "req_id": history_req_id
         }
         
-        print(f"📊 Requesting history for {symbol_name} ({deriv_symbol}) - req_id: {history_req_id}")
         ws.send(json.dumps(history_request))
+        self.subscriptions[history_req_id] = symbol_name
         
-        # Wait before setting up live subscription
-        time.sleep(1)
+        # Wait a moment before subscribing to live stream
+        time.sleep(0.5)
         
-        # Subscribe to live updates
-        stream_req_id = self.get_next_req_id()
-        self.req_id_to_symbol[stream_req_id] = symbol_name
-        
+        # Then subscribe to live updates
         subscription_request = {
             "ticks_history": deriv_symbol,
             "style": "candles", 
@@ -514,28 +498,32 @@ class RealTimeDSRBot:
             "req_id": stream_req_id
         }
         
-        print(f"🔄 Subscribing to live candles for {symbol_name} ({deriv_symbol}) - req_id: {stream_req_id}")
         ws.send(json.dumps(subscription_request))
+        self.subscriptions[stream_req_id] = symbol_name
+        
+        print(f"Requested history and subscription for {symbol_name} ({deriv_symbol})")
     
     def process_initial_history(self, data):
         """Process initial historical candle data"""
         try:
-            req_id = data.get('req_id')
-            symbol_name = self.req_id_to_symbol.get(req_id, f"Unknown({req_id})")
+            req_id = data.get('req_id', '')
+            if not req_id.startswith('hist_'):
+                return
+                
+            symbol_name = self.subscriptions.get(req_id, 'Unknown')
             
             if 'candles' not in data:
-                print(f"❌ No candles in history response for {symbol_name}")
+                print(f"No candles in history response for {symbol_name}")
                 return
             
-            candles_raw = data['candles']
-            print(f"📈 Processing {len(candles_raw)} historical candles for {symbol_name}")
+            print(f"Processing {len(data['candles'])} historical candles for {symbol_name}")
             
             # Clear existing data for this symbol
             self.candle_data[symbol_name].clear()
             
             # Process historical candles
             candle_count = 0
-            for candle_raw in candles_raw:
+            for candle_raw in data['candles']:
                 try:
                     candle = {
                         'epoch': int(candle_raw['epoch']),
@@ -546,63 +534,54 @@ class RealTimeDSRBot:
                     }
                     self.candle_data[symbol_name].append(candle)
                     candle_count += 1
-                except (KeyError, ValueError, TypeError) as e:
-                    if DEBUG:
-                        print(f"⚠️ Skipping invalid candle data: {e}")
+                except (KeyError, ValueError) as e:
+                    print(f"Invalid candle data: {e}")
                     continue
             
-            print(f"✅ Successfully loaded {candle_count} candles for {symbol_name}")
+            print(f"Successfully loaded {candle_count} candles for {symbol_name}")
             
             # Check if we have enough data for analysis
             if candle_count >= 30:
-                print(f"🎯 {symbol_name} ready for signal analysis ({candle_count} candles)")
+                print(f"{symbol_name} ready for signal analysis")
             else:
-                print(f"⚠️ {symbol_name} needs more data ({candle_count}/30 candles)")
+                print(f"Warning: {symbol_name} has only {candle_count} candles (need 30+ for analysis)")
             
         except Exception as e:
-            print(f"❌ Error processing historical data: {e}")
+            print(f"Error processing historical data: {e}")
             if DEBUG:
                 traceback.print_exc()
     
     def process_candle_data(self, data):
-        """Process incoming live candle data and check for signals"""
+        """Process incoming candle data and check for signals"""
         try:
-            req_id = data.get('req_id')
-            symbol_name = self.req_id_to_symbol.get(req_id, f"Unknown({req_id})")
+            # Identify which symbol this data is for
+            req_id = data.get('req_id', '')
+            symbol_name = self.subscriptions.get(req_id, 'Unknown')
             
             if 'candles' not in data:
                 return
             
-            # Process each new candle
+            # Process each candle
             for candle_raw in data['candles']:
-                try:
-                    candle = {
-                        'epoch': int(candle_raw['epoch']),
-                        'open': float(candle_raw['open']),
-                        'high': float(candle_raw['high']),
-                        'low': float(candle_raw['low']),
-                        'close': float(candle_raw['close'])
-                    }
-                    
-                    # Add to our candle storage
-                    self.candle_data[symbol_name].append(candle)
-                    
-                    if DEBUG:
-                        print(f"📊 New candle for {symbol_name}: O={candle['open']:.5f} H={candle['high']:.5f} L={candle['low']:.5f} C={candle['close']:.5f}")
-                    
-                    # Check for signals if we have enough data
-                    if len(self.candle_data[symbol_name]) >= 30:
-                        signal = analyze_signal(symbol_name, list(self.candle_data[symbol_name]))
-                        if signal:
-                            self.handle_signal(signal)
-                            
-                except (KeyError, ValueError, TypeError) as e:
-                    if DEBUG:
-                        print(f"⚠️ Skipping invalid live candle: {e}")
-                    continue
+                candle = {
+                    'epoch': int(candle_raw['epoch']),
+                    'open': float(candle_raw['open']),
+                    'high': float(candle_raw['high']),
+                    'low': float(candle_raw['low']),
+                    'close': float(candle_raw['close'])
+                }
+                
+                # Add to our candle storage
+                self.candle_data[symbol_name].append(candle)
+                
+                # Check for signals on the latest complete candle
+                if len(self.candle_data[symbol_name]) >= 30:
+                    signal = analyze_signal(symbol_name, list(self.candle_data[symbol_name]))
+                    if signal:
+                        self.handle_signal(signal)
         
         except Exception as e:
-            print(f"❌ Error processing live candle data: {e}")
+            print(f"Error processing candle data: {e}")
             if DEBUG:
                 traceback.print_exc()
     
@@ -613,21 +592,15 @@ class RealTimeDSRBot:
         side = signal['side']
         
         # Check cooldown
-        cooldown_key = f"{symbol}_{side}"
-        last_signal_time = self.last_signals.get(cooldown_key, 0)
+        last_signal_time = self.last_signals[f"{symbol}_{side}"]
         if timestamp - last_signal_time < SIGNAL_COOLDOWN:
-            if DEBUG:
-                print(f"⏰ Signal for {symbol} {side} still in cooldown")
             return
         
-        self.last_signals[cooldown_key] = timestamp
+        self.last_signals[f"{symbol}_{side}"] = timestamp
         
         # Create alert message
         trend_emoji = "📈" if signal['trend'] == "UPTREND" else "📉"
-        signal_time = datetime.fromtimestamp(timestamp).strftime("%H:%M:%S UTC")
-        
         alert_text = (f"🎯 {symbol} M5 - {side} SIGNAL\n"
-                     f"⏰ Time: {signal_time}\n"
                      f"{trend_emoji} Trend: {signal['trend']}\n"
                      f"🎨 Pattern: {signal['pattern']}\n"
                      f"📍 Level: {signal['ma_level']} Dynamic S/R\n"
@@ -654,12 +627,12 @@ class RealTimeDSRBot:
                 pass
                 
         except Exception as e:
-            print(f"❌ Error creating/sending chart: {e}")
+            print(f"Error creating/sending chart: {e}")
             # Send text message as fallback
             send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, alert_text)
     
     def connect(self):
-        """Establish WebSocket connection"""
+        """Establish WebSocket connection with improved error handling"""
         try:
             print(f"[{datetime.now()}] Attempting WebSocket connection (attempt {self.reconnect_count + 1})...")
             
@@ -671,30 +644,28 @@ class RealTimeDSRBot:
                 on_close=self.on_close
             )
             
-            # Use run_forever with ping to maintain connection
+            # Use run_forever with timeout to prevent hanging
             self.ws.run_forever(
                 ping_interval=30,  # Send ping every 30 seconds
-                ping_timeout=10    # Wait 10 seconds for pong
+                ping_timeout=10,   # Wait 10 seconds for pong
+                reconnect=5        # Reconnect delay
             )
             
         except Exception as e:
-            print(f"❌ Connection error: {e}")
+            print(f"Connection error: {e}")
             self.connected = False
     
     def run(self):
         """Main bot execution"""
         print(f"[{datetime.now()}] Starting Real-time DSR Bot")
-        print(f"⏰ Max run time: {MAX_RUN_TIME/3600:.1f} hours")
-        print(f"📊 Monitoring symbols: {list(SYMBOLS.keys())}")
-        print(f"🔧 Using sequential integer req_id starting from {self.req_id_counter}")
+        print(f"Max run time: {MAX_RUN_TIME/3600:.1f} hours")
+        print(f"Monitoring symbols: {list(SYMBOLS.keys())}")
         
         # Send startup notification
-        startup_msg = (f"🤖 DSR Bot Started (PROPER INTEGER FIX)\n"
+        startup_msg = (f"🤖 DSR Bot Started\n"
                       f"📊 Symbols: {', '.join(SYMBOLS.keys())}\n"
                       f"⏰ Max runtime: {MAX_RUN_TIME/3600:.1f}h\n"
-                      f"🔄 Timeframe: M5\n"
-                      f"🔧 Using sequential integer req_id (not random)\n"
-                      f"📝 Starting req_id counter: {self.req_id_counter}")
+                      f"🔄 Timeframe: M5")
         send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, startup_msg)
         
         # Connect and run
@@ -716,17 +687,6 @@ class RealTimeDSRBot:
         try:
             while self.running and (time.time() - self.start_time) < MAX_RUN_TIME:
                 time.sleep(10)
-                
-                # Print status every 10 minutes
-                elapsed = (time.time() - self.start_time) / 3600
-                if int(elapsed * 6) % 60 == 0:  # Every 10 minutes
-                    status_msg = (f"🟢 Bot Status Update\n"
-                                f"⏱️ Runtime: {elapsed:.1f}h\n"
-                                f"🔗 Connected: {'Yes' if self.connected else 'No'}\n"
-                                f"🔑 Authorized: {'Yes' if self.authorized else 'No'}\n"
-                                f"📊 Subscribed: {len(self.subscribed_symbols)}/{len(SYMBOLS)}")
-                    print(status_msg)
-                    
         except KeyboardInterrupt:
             print("Received interrupt signal")
         finally:
@@ -738,104 +698,16 @@ class RealTimeDSRBot:
         self.running = False
         
         if self.ws:
-            try:
-                self.ws.close()
-            except:
-                pass
+            self.ws.close()
         
         # Send shutdown notification
         runtime = (time.time() - self.start_time) / 3600
-        total_signals = len([k for k in self.last_signals.keys()])
-        
-        shutdown_msg = (f"🔴 DSR Bot Stopped\n"
-                       f"⏱️ Runtime: {runtime:.1f}h\n"
-                       f"📊 Total signals sent: {total_signals}\n"
-                       f"🔄 Auto-restart in progress...")
+        shutdown_msg = f"🔴 DSR Bot Stopped\n⏱️ Runtime: {runtime:.1f}h\n🔄 Auto-restart in progress..."
         send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, shutdown_msg)
 
 # -------------------------
 # Main Execution
 # -------------------------
 if __name__ == "__main__":
-    try:
-        bot = RealTimeDSRBot()
-        bot.run()
-    except Exception as e:
-        print(f"❌ Critical error: {e}")
-        traceback.print_exc()
-        
-        # Send error notification
-        error_msg = f"🚨 DSR Bot Crashed\n❌ Error: {str(e)[:200]}"
-        send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, error_msg)_id_counter}")
-        send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, startup_msg)
-        
-        # Connect and run
-        self.connect()
-        
-        # Monitor runtime in a separate thread
-        def runtime_monitor():
-            while self.running and (time.time() - self.start_time) < MAX_RUN_TIME:
-                time.sleep(60)  # Check every minute
-            
-            if self.running:
-                print(f"[{datetime.now()}] Max runtime reached, shutting down...")
-                self.shutdown()
-        
-        runtime_thread = threading.Thread(target=runtime_monitor, daemon=True)
-        runtime_thread.start()
-        
-        # Keep main thread alive
-        try:
-            while self.running and (time.time() - self.start_time) < MAX_RUN_TIME:
-                time.sleep(10)
-                
-                # Print status every 10 minutes
-                elapsed = (time.time() - self.start_time) / 3600
-                if int(elapsed * 6) % 60 == 0:  # Every 10 minutes
-                    status_msg = (f"🟢 Bot Status Update\n"
-                                f"⏱️ Runtime: {elapsed:.1f}h\n"
-                                f"🔗 Connected: {'Yes' if self.connected else 'No'}\n"
-                                f"🔑 Authorized: {'Yes' if self.authorized else 'No'}\n"
-                                f"📊 Subscribed: {len(self.subscribed_symbols)}/{len(SYMBOLS)}")
-                    print(status_msg)
-                    
-        except KeyboardInterrupt:
-            print("Received interrupt signal")
-        finally:
-            self.shutdown()
-    
-    def shutdown(self):
-        """Graceful shutdown"""
-        print(f"[{datetime.now()}] Shutting down bot...")
-        self.running = False
-        
-        if self.ws:
-            try:
-                self.ws.close()
-            except:
-                pass
-        
-        # Send shutdown notification
-        runtime = (time.time() - self.start_time) / 3600
-        total_signals = len([k for k in self.last_signals.keys()])
-        
-        shutdown_msg = (f"🔴 DSR Bot Stopped\n"
-                       f"⏱️ Runtime: {runtime:.1f}h\n"
-                       f"📊 Total signals sent: {total_signals}\n"
-                       f"🔄 Auto-restart in progress...")
-        send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, shutdown_msg)
-
-# -------------------------
-# Main Execution
-# -------------------------
-if __name__ == "__main__":
-    try:
-        bot = RealTimeDSRBot()
-        bot.run()
-    except Exception as e:
-        print(f"❌ Critical error: {e}")
-        traceback.print_exc()
-        
-        # Send error notification
-        error_msg = f"🚨 DSR Bot Crashed\n❌ Error: {str(e)[:200]}"
-        send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, error_msg)
+    bot = RealTimeDSRBot()
+    bot.run()
